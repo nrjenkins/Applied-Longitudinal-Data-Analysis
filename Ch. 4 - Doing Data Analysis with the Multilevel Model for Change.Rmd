@@ -1,0 +1,483 @@
+---
+title: "Chapter 4 - Doing Data Analysis with the Multilevel Model for Change"
+output: html_notebook
+---
+
+# Example: Changes in Adolescent Alcohol Use
+
+Load the data.
+
+```{r}
+library(tidyverse)
+
+alcohol1_pp <- read_csv("data/alcohol1_pp.csv")
+
+head(alcohol1_pp)
+
+# figure 4.1
+alcohol1_pp %>%
+  filter(id %in% c(4, 14, 23, 32, 41, 56, 65, 82)) %>%
+  ggplot(., aes(x = age, y = alcuse)) +
+  facet_wrap(~ id, ncol = 4) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_x_continuous(limits = c(13, 17)) +
+  ggpubr::theme_pubr()
+```
+
+We fit the 1-level model:
+
+$$
+\text{alcuse}_{ij} = \pi_{0i} + \pi_{1i}TIME_{ij} + \epsilon_{ij}
+$$
+
+-   $\pi_{0i}$ represents individual *i*'s true initial status, the value of the outcome when \$TIME\_{ij}\$ = 0.
+
+-   $\pi_{1i}$ represents individual *i*'s true rate of change during the period under study.
+
+-   $\epsilon_{ij}$ represents that portion of individual *i*'s outcome that is unpredicted on occasion *j*
+
+```{r}
+set.seed(4)
+
+alcohol1_pp %>%
+  group_by(id) %>%
+  nest() %>%
+  sample_n(size = 32, replace = TRUE) %>%
+  unnest(data) %>%
+  mutate(coa = ifelse(coa == 0, "coa = 0", "coa == 1")) %>%
+  ggplot(aes(x = age, y = alcuse, group = id)) +
+  facet_wrap(~ coa) +
+  stat_smooth(method = "lm", se = FALSE, size = 1/4) +
+  coord_cartesian(xlim = c(13, 17), ylim = c(-1, 4)) +
+  ggpubr::theme_pubr()
+
+set.seed(4)
+
+alcohol1_pp %>% 
+  group_by(id) %>% 
+  nest() %>% 
+  ungroup() %>% 
+  sample_n(size = 32, replace = T) %>% 
+  unnest(data) %>%
+  mutate(hp = ifelse(peer < mean(peer), "low peer", "high peer")) %>%
+  mutate(hp = factor(hp, levels = c("low peer", "high peer"))) %>%
+
+  ggplot(aes(x = age, y = alcuse, group = id)) +
+  stat_smooth(method = "lm", se = F, size = 1/4) +
+  coord_cartesian(xlim = c(13, 17),
+                  ylim = c(-1, 4)) +
+  ggpubr::theme_pubr() +
+  facet_wrap(~ hp)
+```
+
+We now posit a level-2 submodel for interindividual differences in change: $$
+\begin{aligned}
+\pi_{0i} &= \gamma_{00} + \gamma_{01} \text{COA}_i + \epsilon_{0i} \\
+\pi_{1i} &= \gamma_{10} + \gamma_{11} \text{COA}_i + \epsilon_{1i} \\
+\end{aligned}
+$$
+
+-   $\gamma_{00}$ and $\gamma_{10}$ are the level-2 intercepts and represent the population average initial status and rate of change for a child of a non-alcoholic (COA = 0).
+
+-   $\gamma_{01}$ and $\gamma_{11}$ are the level-2 slopes and represent the effect of COA on the change trajectories for initial status and rates of change for children of alcoholics.
+
+# The Composite Specification of the Multilevel Model for Change
+
+The composite model collapses these submodels into a single specification.
+
+$$
+\begin{aligned}
+Y_{ij} &= \pi_{0i} + \pi_{1i}TIME_{ij} + \epsilon_{ij} \\
+&= (\gamma_{00} + \gamma_{01}COA_{i} + \epsilon_{0i}) + (\gamma_{01} + \gamma_{11}COA_i + \epsilon_{1i})TIME_{ij} + \epsilon_{ij}
+\end{aligned}
+$$
+
+This simplifies to:
+
+$$
+Y_{ij} = [\gamma_{00} + \gamma_{10}TIME_{ij} + \gamma_{01}COA_i + \gamma_{11}(COA_{i} \times TIME_{ij})] + [\epsilon_{0i} + \epsilon_{1i}TIME_{ij} + \epsilon_{ij}]
+$$
+
+# First Steps: Fitting Two Unconditional Multilevel Models for Change
+
+First you should fit the unconditional means model and the unconditional growth model. These models allow you to examine variation first across people without regard to time, and second across both people and time. The results of these models will allow you to establish whether there is systematic variation in your outcome that is worth exploring, and where that variation resides (within or between people).
+
+## The Unconditional Means Model
+
+```{r}
+library(brms)
+library(cmdstanr)
+
+fit4.1 <- brm(data = alcohol1_pp, 
+              family = gaussian,
+              alcuse ~ 1 + (1 | id),
+              prior = c(prior(student_t(3, 1, 10), class = Intercept),
+                        prior(student_t(3, 0, 10), class = sd),
+                        prior(student_t(3, 0, 10), class = sigma)),
+              iter = 2000, warmup = 1000, chains = 4, cores = 4,
+              backend = "cmdstan")
+print(fit4.1)
+```
+
+The intraclass correlation coefficient describes the proportion of the total outcome variation that lies "between" people.
+
+```{r}
+library(bayestestR)
+library(performance)
+icc(fit4.1)
+```
+
+This means that half of the variation in alcohol use is attributable to differences between adolescents.
+
+## The Unconditional Growth Model
+
+The next step is the introduction of predictor TIME into the level-1 submodel.
+
+```{r}
+fit4.2 <- brm(data = alcohol1_pp, 
+              family = gaussian,
+              alcuse ~ 0 + Intercept + age_14 + (1 + age_14 | id),
+              prior = c(prior(student_t(3, 0, 10), class = sd),
+                        prior(student_t(3, 0, 10), class = sigma),
+                        prior(lkj(1), class = cor)),
+              iter = 2000, warmup = 1000, chains = 4, cores = 4,
+              backend = "cmdstan")
+print(fit4.2)
+
+conditional_effects(fit4.2)
+```
+
+# Practical Data Analytic Strategies for Model Building
+
+## Interpreting Fitted Models
+
+### Model C: The Uncontrolled Effects of COA
+
+```{r}
+fit4.3 <- brm(alcuse ~ 0 + Intercept + age_14 + coa + age_14:coa + 
+                (1 + age_14 | id),
+              family = gaussian,
+              prior = c(prior(student_t(3, 0, 10), class = sd),
+                        prior(student_t(3, 0, 10), class = sigma),
+                        prior(lkj(1), class = cor)),
+              data = alcohol1_pp,
+              cores = 4,
+              backend = "cmdstan")
+print(fit4.3)
+
+library(lme4)
+fit4.3.fq <- lmer(alcuse ~ age_14 + coa + age_14:coa + (1 + age_14 | id),
+                  data = alcohol1_pp)
+summary(fit4.3.fq)
+```
+
+Model C includes COA as a predictor of both initial status and change. Interpretation of its four fixed effects is straightforward: (1) the estimated initial ALCUSE for the average child of non-alcoholic parents is 0.32; (2) the estimated differential in initial ALCUSE between children of alcoholic and non-alcoholic parents is 0.74; (3) the estimated rate of change in ALCUSE for an average child of non-alcoholic parents is 0.29; (4) the estimated rate of change in ALCUSE between children of alcoholic and non-alcoholic parents is -0.05.
+
+This model provides uncontrolled answers to our research questions, suggesting that while children of alcoholic parents initially drink more than children of non-alcoholic parents, their rate of change in alcohol consumption between ages 14 and 16 does not differ.
+
+Now the variance components. The within-person variance is the residual estimate under `Family Specific Parameters` and is equal to $0.60^2 = 0.36$. This suggests that we need to explore the effects of time-varying predictors (to explain individual variation over time). Now we look at the level-2 variance components. The variance in the initial status of ALCUSE for the average child of non-alcoholic parents is $0.70^2 = 0.49$. Similarly, the variance in rate of change between individuals is $0.37^2 = 0.14$ suggesting the continual presence of explainable variation in the rate of change. We should consider adding level-2 predictors to explain the the interindividual differences.
+
+```{r}
+conditional_effects(fit4.3)
+```
+
+Let's recode `coa` as a factor to get a more accurate plot.
+
+```{r}
+fit4.4 <- update(fit4.3,
+                 newdata = alcohol1_pp %>% mutate(coa = factor(coa)),
+                 cores = 4, 
+                 backend = "cmdstan")
+
+conditional_effects(fit4.4)
+```
+
+### Model D: The Controlled Effects of COA
+
+Model D estimates the effects of COA on initial status and rates fo change in ALCUSE, controlling for the effects of PEER in initial status and rate of change.
+
+```{r}
+fit4.5 <- brm(alcuse ~ 0 + Intercept + age_14 + coa + peer + age_14:coa + 
+                age_14:peer + (1 + age_14 | id),
+              family = gaussian,
+              prior = c(prior(student_t(3, 0, 10), class = sd),
+                        prior(student_t(3, 0, 10), class = sigma),
+                        prior(lkj(1), class = cor)),
+              data = alcohol1_pp,
+              cores = 4,
+              backend = "cmdstan")
+print(fit4.5, digits = 3)
+```
+
+The level-2 intercept reverses sign and increases: $-0.24$. This change happens because each level-2 intercept represents the value of the associated individual growth parameter when all predictors in each level-2 model are 0. We can interpret this as children of non-alcoholic parents whose early peers do not drink have non-zero levels of alcohol consumption themselves.
+
+-   `coa` and `age_14:coa` describe the differential in ALCUSE between children of alcoholic and non-alcoholic parents controlling for the effects of PEER.
+-   `peer` and `age_14:peer` describe the differential in ALCUSE for a one-unit difference in PEER controlling for the effect of COA.
+
+We conclude that, controlling for the effects of PEER: (1) the estimated differential in initial ALCUSE between children of alcoholic and non-alcoholic parents is $0.58$; and (2) the estimated differential in the rate of change in ALCUSE between children of alcoholic and non-alcoholic parents is $-0.014$. This model provides controlled answers to our research questions. We conclude that children of alcoholic parents initially drink more than children of non-alcoholic parents but their annual rate of change in consumption between ages 14 and 16 is no different.
+
+### Model E: A Tentative "Final Model" for the Controlled Effects of COA
+
+Model E includes PEER as a predictor of both initial status and change but COA as a predictor of only initial status.
+
+```{r}
+fit4.6 <- brm(alcuse ~ 0 + Intercept + age_14 + coa + peer + age_14:peer + 
+                (1 + age_14 | id),
+              family = gaussian,
+              prior = c(prior(student_t(3, 0, 10), class = sd),
+                        prior(student_t(3, 0, 10), class = sigma),
+                        prior(lkj(1), class = cor)),
+              data = alcohol1_pp,
+              cores = 4,
+              backend = "cmdstan")
+print(fit4.6, digits = 3)
+```
+
+Controlling for the effects of PEER, the estimated differential in initial ALCUSE between children of alcoholic and non-alcoholic parents is $0.57$ and controlling for the effect of parental alcoholism, for each 1-point difference in PEER: the average initial ALCUSE is $0.70$ higher and the average rate of change in ALCUSE is $-0.15$ lower. We conclude that children of alcoholic parents drink more alcohol initially than children of non-alcoholic parents but their rate of change in consumption between ages 14 and 16 is no different. We also conclude that PEER is positively associated with early consumption but negatively associated with the rate of change in consumption. 14-year-old's whose friends drink more tend to drink more at that age, but they have a slower rate of increase in consumption over time.
+
+## Displaying Prototypical Change Trajectories
+
+Compute the fitted values for each group of COA:
+
+```{r}
+post <- posterior_samples(fit4.3)
+
+post %>%
+  select(starts_with("b_")) %>%
+  head()
+
+post %>%
+  select(starts_with("b_")) %>%
+  transmute(pi_0_coa0 = b_Intercept + b_coa * 0,
+            pi_1_coa0 = b_age_14 + `b_age_14:coa` * 0,
+            pi_0_coa1 = b_Intercept + b_coa * 1,
+            pi_1_coa1 = b_age_14 + `b_age_14:coa` * 1) %>%
+  pivot_longer(everything()) %>%
+  group_by(name) %>%
+  summarise(posterior_mean = mean(value) %>% round(digits = 3))
+
+post %>%
+  select(starts_with("b_")) %>%
+  mutate(y = b_Intercept + b_coa * 1 + b_age_14 * 0 + `b_age_14:coa` * 0 * 1) %>%
+  head()
+
+post %>%
+  select(starts_with("b_")) %>%
+  mutate(y = b_Intercept + b_coa * 1 + b_age_14 * 0 + `b_age_14:coa` * 0 * 1) %>%
+  summarise(pi_0_coa1 = mean(y))
+```
+
+Better to work with prototypical values of predictors rather than getting a fitted function for each predictor. Prototypical values can be selected by these strategies:
+
+-   Choose substantively interesting values.
+
+-   Use a range of percentiles.
+
+-   Use the sample mean $\pm 0.5$ (or 1) standard deviation.
+
+-   Use the sample mean.
+
+We can computed the fitted values with the `fitted()` function in `brms`.
+
+```{r}
+nd <- tibble(age_14 = seq(from = 0, to = 2, length.out = 30))
+
+f <- 
+  fitted(fit4.2, 
+            newdata = nd,
+            re_formula = NA) %>%
+  data.frame() %>%
+  bind_cols(nd) %>%
+  mutate(age = age_14 + 14)
+
+head(f)
+
+f %>%
+  ggplot(aes(x = age)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5), fill = "grey75", alpha = 3/4) +
+  geom_line(aes(y = Estimate)) +
+  scale_y_continuous("alcuse", breaks = 0:2, limits = c(0, 2)) +
+  coord_cartesian(xlim = c(13, 17)) +
+  ggpubr::theme_pubr()
+
+nd <- 
+  expand_grid(coa = 0:1,
+              peer = c(0.655, 1.381),
+              age_14 = seq(from = 0, to = 2, length.out = 30))
+
+head(nd, n = 10)
+
+f <- 
+  fitted(fit4.6,
+         newdata = nd,
+         re_formula = NA) %>%
+  data.frame() %>%
+  bind_cols(nd) %>%
+  mutate(age = age_14 + 14,
+         coa = ifelse(coa == 0, "coa = 0", "coa = 1"),
+         peer = factor(peer))
+
+head(f)
+
+f %>%
+  ggplot(aes(x = age, color = peer, fill = peer)) +
+  facet_wrap(~ coa) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5), size = 0, alpha = 1/4) +
+  geom_line(aes(y = Estimate, size = peer)) +
+  scale_size_manual(values = c(1/2, 1)) +
+  scale_fill_manual(values = c("blue3", "red3")) +
+  scale_color_manual(values = c("blue3", "red3")) +
+  scale_y_continuous("alcuse", breaks = 0:2) +
+  labs(subtitle = "High peer values are in red; low ones are in blue.") +
+  coord_cartesian(xlim = c(13, 17)) +
+  ggpubr::theme_pubr()
+```
+
+## Recentering Predictors to Improve Interpretation
+
+# Model-based (Empirical Bayes Estimates of the Individual Growth Parameters
+
+Here we use the multilevel model estimates to construct ID level trajectories.
+
+```{r}
+alcohol1_pp %>%
+  select(id:coa, cpeer, alcuse) %>%
+  filter(id == 23)
+```
+
+```{r}
+fit4.7 <-
+  update(fit4.6,
+         newdata = alcohol1_pp,
+         alcuse ~ 0 + Intercept + age_14 + coa + cpeer + age_14:cpeer + (1 + age_14 | id),
+         iter = 2000, warmup = 1000, chains = 4, cores = 4,
+         seed = 4)
+
+
+post.23 <- 
+  posterior_samples(fit4.7) %>%
+  select(starts_with("b_")) %>%
+  mutate(`pi[0][",23"]` = b_Intercept + b_coa * 1 + b_cpeer * -1.018,
+         `pi[1][",23"]` = b_age_14 + `b_age_14:cpeer` * -1.018)
+
+head(post.23)
+
+post.23 %>% 
+  pivot_longer(starts_with("pi")) %>% 
+  group_by(name) %>% 
+  summarise(mean = mean(value),
+            ll   = quantile(value, probs = .025),
+            ul   = quantile(value, probs = .975)) %>% 
+  mutate_if(is.double, round, digits = 3)
+
+post.23 <-
+  posterior_samples(fit4.7) %>% 
+  select(starts_with("b_"), contains("23"))
+
+glimpse(post.23)
+
+post.23 <-
+  post.23 %>% 
+  mutate(`pi[0][",23"]` = b_Intercept + b_coa * 1 + b_cpeer * -1.018 + `r_id[23,Intercept]`,
+         `pi[1][",23"]` = b_age_14 + `b_age_14:cpeer` * -1.018 + `r_id[23,age_14]`)
+
+glimpse(post.23)
+
+post.23 %>% 
+  pivot_longer(starts_with("pi")) %>% 
+  group_by(name) %>% 
+  summarise(mean = mean(value),
+            ll   = quantile(value, probs = .025),
+            ul   = quantile(value, probs = .975)) %>% 
+  mutate_if(is.double, round, digits = 3)
+```
+
+Plotting fitted trajectories.
+
+```{r}
+nd <- 
+  alcohol1_pp %>%
+  select(id:coa, age_14:alcuse, cpeer) %>%
+  filter(id %in% c(4, 14, 23, 32, 41, 56, 65, 82)) %>%
+  mutate(id_label = ifelse(id < 10, str_c("0", id), id)) %>%
+  mutate(id_label = str_c("id = ", id_label))
+
+head(nd)
+
+f <- 
+  fitted(fit4.7,
+         newdata = nd) %>%
+  data.frame() %>%
+  bind_cols(nd)
+
+f %>%
+  ggplot(aes(x = age, y = Estimate)) +
+  facet_wrap(~ id_label, ncol = 4) +
+  geom_line(size = 1) +
+  scale_y_continuous("alcuse", breaks = 0:4, limits = c(-1, 4)) +
+  xlim(13, 17) +
+  ggpubr::theme_pubr()
+```
+
+```{r}
+f.gamma.only <- 
+  fitted(fit4.7, newdata = nd, re_formula = NA) %>%
+  data.frame() %>%
+  bind_cols(nd)
+
+glimpse(f.gamma.only)
+
+f %>%
+  ggplot(aes(x = age)) +
+  # id specific lines
+  geom_line(aes(y = Estimate), size = 1) +
+  # gamma-centric lines
+  geom_line(data = f.gamma.only, aes(y = Estimate), size = 1/2) +
+  # OLS lines
+  stat_smooth(data = nd, aes(y = alcuse), method = "lm", se = F, color = "black",
+              linetype = 2, size = 1/2) +
+  # data points
+  geom_point(data = nd, aes(y = alcuse)) +
+  scale_y_continuous("alcuse", breaks = 0:4, limits = c(-1, 4)) +
+  xlim(13, 17) +
+  ggpubr::theme_pubr() +
+  facet_wrap(~ id_label, ncol = 4)
+```
+
+Model-based fits with uncertainty.
+
+```{r}
+f %>%
+  ggplot(aes(x = age, y = Estimate)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5), fill = "grey75") +
+  geom_line(size = 1) +
+  geom_point(data = nd, aes(y = alcuse)) +
+  scale_y_continuous("alcuse", breaks = 0:4, limits = c(-1, 4)) +
+  xlim(13, 17) +
+  ggpubr::theme_pubr() +
+  facet_wrap(~ id_label, ncol = 4)
+```
+
+```{r}
+# we need an expanded version of the `nd`
+nd_expanded <-
+  alcohol1_pp %>% 
+  select(id, coa, cpeer) %>% 
+  filter(id %in% c(4, 14, 23, 32, 41, 56, 65, 82)) %>% 
+  # this part is important!
+  expand(nesting(id, coa, cpeer),
+         age_14 = seq(from = 0, to = 2, length.out = 30)) %>% 
+  mutate(id_label = ifelse(id < 10, str_c("0", id), id)) %>% 
+  mutate(id_label = str_c("id = ", id_label),
+         age      = age_14 + 14)
+
+# pump our `nd_expanded` into `fitted()`
+f <-
+  fitted(fit4.7,
+         newdata = nd_expanded) %>% 
+  data.frame() %>% 
+  bind_cols(nd_expanded)
+
+glimpse(f)
+```
