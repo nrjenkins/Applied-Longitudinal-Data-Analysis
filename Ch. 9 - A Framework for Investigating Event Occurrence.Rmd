@@ -1,0 +1,24 @@
+---
+title: "Chapter 9 - A Framework for Investigating Event Occurrence"
+output: html_notebook
+---
+
+# Framing a Research Question about Event Occurrence
+
+To determine whether a research question lends itself to survival analysis, you must also examine a study's methodological features.
+
+1.  Target event, whose occurrence is being studied
+2.  Beginning of time, an initial starting point when no one under study has yet experienced the target event
+3.  Metric for clocking time, a meaningful scale in which event occurrence is recorded
+
+## Defining Event Occurrence
+
+Event occurrence represents an individual's transition from one "state" to another "state."
+
+## Identifying the "Beginning of Time"
+
+A moment when everyone in the population occupies one, and only one, of the possible states. The timing of the transition between the beginning of time to the event occurrence is called event time.
+
+## Specifying a Metric for Time
+
+Once you identify the beginning of time, you must select the units in which you will record its passage.
