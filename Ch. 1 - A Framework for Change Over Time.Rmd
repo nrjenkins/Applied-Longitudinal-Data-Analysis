@@ -1,0 +1,32 @@
+---
+title: "Chapter 1 - A framework for Investigating Change over Time"
+output: html_document
+---
+
+Two types of change:
+
+1.  within-individual change - how does each person change overtime?
+2.  Interindividual differences in change - what predicts differences among people in their changes?
+
+## Distinguishing Between Two Types of Questions about Change
+
+1.  how does the outcome change over time?
+2.  can we predicted differences in these changes?
+
+Theses two questions will develop into a pair of statistical models:
+
+-   in level-1 we ask about within-individual change over time: each person's growth trajectory
+
+    -   the goal is to describe the shape of the growth
+
+-   in level-2 we ask about interindividual differences in change: whether different people manifest different patterns of within-individual change and ask what predicts these differences
+
+    -   goal is to detect heterogeneity in change across individuals and to determine the relationship between predictors and the shape of each person's individual growth trajectory
+
+## Three important features of a study of change
+
+-   three of more waves of data
+
+-   an outcome whose values change systematically over time
+
+-   a sensible metric for clocking time

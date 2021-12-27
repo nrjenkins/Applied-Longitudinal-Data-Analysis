@@ -1,0 +1,226 @@
+---
+title: "Chapter 10 - Describing Discrete-Time Event Occurrence Data"
+output: html_notebook
+---
+
+# The Life Table
+
+The fundamental tool for summarizing the sample distribution of event occurrence is the life table. A life table tracks the event histories of a sample of individuals from the beginning of time through the end of data collection.
+
+```{r}
+library(tidyverse)
+
+teachers.data <- read_csv("data/teachers.csv")
+
+glimpse(teachers.data)
+```
+
+Build the life table:
+
+```{r}
+library(survival)
+
+fit10.1 <- survfit(data = teachers.data, Surv(t, 1 - censor) ~ 1)
+
+str(fit10.1)
+```
+
+The life table includes information on the number of individuals who:
+
+* entered the interval
+* experienced the target event during the interval
+* were censored at the end of the interval
+
+## A Framework for Characterizing the Distribution of Discrete-Time Event Occurrence Data
+
+### Hazard Function
+
+Hazard functions are used to assess the risk of event occurrence in each discrete time period. 
+
+```{r}
+most_rows <-
+  tibble(year = fit10.1$time) %>% 
+  mutate(time_int   = str_c("[", year, ", ", year + 1, ")"), 
+         n_employed = fit10.1$n.risk, 
+         n_left     = fit10.1$n.event) %>% 
+  mutate(n_censored   = n_employed - n_left - lead(n_employed, default = 0),
+         hazard_fun   = n_left / n_employed,
+         survivor_fun = fit10.1$surv)
+
+most_rows
+
+row_1 <-
+  tibble(year         = 0, 
+         time_int     = "[0, 1)", 
+         n_employed   = fit10.1$n.risk[1], 
+         n_left       = NA, 
+         n_censored   = NA, 
+         hazard_fun   = NA, 
+         survivor_fun = 1)
+
+d <-
+  bind_rows(row_1,
+            most_rows)
+
+d
+
+d %>% 
+  ggplot(aes(x = year, y = hazard_fun)) +
+  geom_line() +
+  scale_x_continuous("years in teaching", breaks = 0:13, limits = c(0, 13)) +
+  scale_y_continuous(expression("estimated hazard probability, "*hat(italic(h))(italic(t[j]))), 
+                     breaks = c(0, .05, .1, .15), limits = c(0, .15)) +
+  theme(panel.grid = element_blank())
+```
+
+### Survivor Function
+
+The survivor function cumulates the periord-by-period risks of event occurrence together to assess the probability that a randomly selected individual will "survive."
+
+```{r}
+d %>% 
+  ggplot(aes(x = year, y = survivor_fun)) +
+  geom_hline(yintercept = .5, color = "white", linetype = 2) +
+  geom_line() +
+  scale_x_continuous("years in teaching", breaks = 0:13, limits = c(0, 13)) +
+  scale_y_continuous(expression("estimated survival probability, "*hat(italic(S))(italic(t[j]))),
+                     breaks = c(0, .5, 1), limits = c(0, 1)) +
+  theme(panel.grid = element_blank())
+```
+
+### Median Lifetime
+
+# Developing Intuition About Hazard Functions, Survivor Functions, and Median Lifetimes
+
+# A Simple and Useful Strategy for Constructing the Life Table
+
+```{r}
+teachers.data %>% 
+  filter(id %in% c(20, 126, 129))
+
+teachers.pp <-
+  teachers.data %>% 
+  uncount(weights = t) %>% 
+  group_by(id) %>% 
+  mutate(period = 1:n()) %>% 
+  mutate(event = if_else(period == max(period) & censor == 0, 1, 0)) %>% 
+  select(-censor) %>% 
+  ungroup()
+
+teachers.pp %>% 
+  filter(id %in% c(20, 126, 129))
+
+# count censored observations
+teachers.pp %>%
+  group_by(id) %>%
+  summarise(period = max(period),
+            event = last(event)) %>%
+  count(event)
+
+teachers.data %>%
+  distinct(id) %>%
+  count()
+```
+
+# Using the Person-Period Data Set to Construct the Life Table
+
+```{r}
+teachers_lt <-
+  teachers.pp %>% 
+  # change the coding for `event` in anticipation of the final format
+  mutate(event = str_c("event = ", event)) %>% 
+  group_by(period) %>% 
+  count(event) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = event,
+              values_from = n) %>% 
+  mutate(total = `event = 0` + `event = 1`) %>% 
+  mutate(prop_e_1 = (`event = 1` / total) %>% round(digits = 4))
+
+teachers_lt
+```
+
+# Fit the Discrete-time Hazard Model with BRMS
+
+```{r}
+library(brms)
+library(cmdstanr)
+
+teachers_lt <- 
+  teachers_lt %>%
+  mutate(period = factor(period),
+         event = `event = 1`)
+
+fit10.6 <- 
+  brm(event | trials(total) ~ 0 + period,
+      family = binomial(link = "logit"),
+      data = teachers_lt,
+      prior(normal(0, 4), class = b),
+      cores = 4,
+      backend = "cmdstan")
+
+print(fit10.6)
+
+# convert coefficients back to the probability scale
+fixef(fit10.6) %>% inv_logit_scaled()
+```
+
+Plot the hazard function:
+
+```{r}
+library(tidybayes)
+
+posterior_samples(fit10.6) %>% 
+  select(starts_with("b_")) %>% 
+  mutate_all(inv_logit_scaled) %>% 
+  set_names(1:12) %>% 
+  pivot_longer(everything(),
+               names_to = "period",
+               values_to = "hazard") %>% 
+  mutate(period = as.double(period)) %>% 
+  
+  ggplot(aes(x = period, y = hazard)) +
+  stat_lineribbon(.width = c(.5, .95), size = 1/3) +
+  # add the hazard estimates from `survival::survfit()`
+  geom_point(data = tibble(period = fit10.1$time,
+                           hazard = fit10.1$n.event / fit10.1$n.risk),
+             aes(y = hazard),
+             size = 2, color = "violetred1") +
+  scale_fill_manual("CI", values = c("grey75", "grey60")) +
+  scale_x_continuous(breaks = 1:12) +
+  theme(legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(color = "grey92"),
+        legend.position = c(.925, .825),
+        panel.grid = element_blank())
+```
+
+Compare standarad errors:
+
+```{r}
+posterior_samples(fit10.6) %>% 
+  select(starts_with("b_")) %>% 
+  mutate_all(inv_logit_scaled) %>% 
+  set_names(1:12) %>% 
+  pivot_longer(everything(),
+               names_to = "period",
+               values_to = "hazard") %>% 
+  mutate(period = period %>% as.double()) %>% 
+  group_by(period) %>% 
+  summarise(sd = sd(hazard)) %>% 
+  bind_cols(se_h_hat %>% select(se_h_hat)) %>% 
+  pivot_longer(-period) %>% 
+  mutate(name = factor(name,
+                       levels = c("sd", "se_h_hat"),
+                       labels = c("Bayesian", "ML"))) %>% 
+  
+  ggplot(aes(x = period, y = value, color = name)) +
+  geom_point(size = 3, position = position_dodge(width = .25)) +
+  scale_color_viridis_d(NULL, option = "A", end = .55) +
+  scale_x_continuous(breaks = 1:12) +
+  scale_y_continuous(expression(italic(se)), limits = c(0, 0.01)) +
+  theme(legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(color = "grey92"),
+        legend.position = c(.09, .9),
+        panel.grid = element_blank())
+```
+
