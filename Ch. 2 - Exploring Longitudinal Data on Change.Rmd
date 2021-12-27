@@ -1,0 +1,342 @@
+---
+title: "Chapter 2 - Exploring Longitudinal Data on Change"
+output: html_notebook
+---
+
+# Longitudinal Data Sets
+
+## Person-level Data
+
+With person-level data, each participant has a single row and multiple variables contain the data from each measurement occasion.
+
+```{r}
+library(tidyverse)
+
+tolerance <- 
+  read_csv("https://stats.idre.ucla.edu/wp-content/uploads/2016/02/tolerance1.txt", 
+           col_names = T)
+
+head(tolerance, n = 16)
+```
+
+```{r}
+tolerance %>%
+  nrow()
+
+# correlation matrix
+library(DataExplorer)
+plot_correlation(tolerance)
+
+## or
+cor(tolerance[ , 2:6]) %>%
+  data.frame() %>%
+  rownames_to_column("row") %>%
+  pivot_longer(-row,
+               names_to = "column",
+               values_to = "correlation") %>%
+  mutate(row = factor(row) %>% fct_rev(.)) %>%
+  ggplot(aes(x = column, y = row)) +
+  geom_raster(aes(fill = correlation)) +
+  geom_raster(aes(fill = correlation)) + 
+  geom_text(aes(label = round(correlation, digits = 2)),
+            size = 3.5) +
+  scale_fill_gradient(low = "white", high = "red4", limits = c(0, 1)) +
+  scale_x_discrete(NULL, position = "top", expand = c(0, 0)) +
+  scale_y_discrete(NULL, expand = c(0, 0)) +
+  theme(axis.ticks = element_blank())
+
+## just the lower diagonal
+library(psych)
+lowerCor(tolerance[ , 2:6])
+```
+
+## The person-period data set
+
+Each person has multiple records - one for each measurement occasion. This format is the one that most naturally supports analysis of change over time.
+
+```{r}
+tolerance_pp <- 
+  read_csv("https://stats.idre.ucla.edu/wp-content/uploads/2016/02/tolerance1_pp.txt",
+           col_names = T)
+
+tolerance_pp %>%
+  slice(c(1:9, 76:80))
+```
+
+With this data we need to count the number of distinct IDs
+
+```{r}
+tolerance_pp %>% 
+  distinct(id) %>% 
+  count()
+```
+
+The `pivot_longer()` function will get you from the person-level format to the person-period format.
+
+```{r}
+# Convert tolerance data to long form
+tolerance %>%
+  pivot_longer(-c(id, male, exposure),
+               names_to = "age",
+               values_to = "tolerance") %>%
+  # remove the `tol` prefix from the `age` values then save the numbers as integers
+  mutate(age = str_remove(age, "tol") %>% as.integer()) %>%
+  arrange(id, age) %>%
+  slice(c(1:9, 76:80))
+```
+
+The `pivot_wider()` function can be used to convert the person-period data to person-level data.
+
+```{r}
+tolerance_pp %>%
+  # add `tot` prefix back to `age`
+  mutate(age = str_c("tot", age)) %>%
+  select(-time) %>%
+  pivot_wider(names_from = age, values_from = tolerance)
+```
+
+# Descriptive analysis fo individual change over time
+
+## Empirical Growth Plots
+
+These plots are designed to address the question, "How does each person change over time?"
+
+```{r}
+tolerance_pp %>%
+  ggplot(aes(x = age, y = tolerance)) +
+  geom_point() +
+  geom_line() +
+  coord_cartesian(ylim = c(1, 4)) +
+  theme(panel.grid = element_blank()) +
+  facet_wrap(~ id)
+```
+
+### Nonparametric Smoothing
+
+```{r}
+tolerance_pp %>%
+  ggplot(aes(x = age, y = tolerance)) +
+  geom_point() +
+  stat_smooth(method = "loess", se = F, span = 0.9) +
+  coord_cartesian(ylim = c(1, 4)) +
+  theme(panel.grid = element_blank()) +
+  facet_wrap(~ id)
+```
+
+### Bayesian Single-level Regression Smoothing
+
+```{r}
+# created a tibble of tibbles
+by_id <- 
+  tolerance_pp %>%
+  mutate(age_c = age - mean(age, na.rm = TRUE)) %>%
+  group_by(id) %>%
+  nest()
+
+by_id %>% head()
+
+by_id$data[[1]]
+
+library(brms)
+library(cmdstanr)
+fit2.1 <- brm(data = by_id$data[[1]],
+              formula = tolerance ~ 1 + time,
+              prior = prior(normal(0, 2), class = b),
+              iter = 4000,
+              chains = 4, 
+              cores = 4,
+              seed = 2,
+              backend = "cmdstan")
+print(fit2.1)
+
+# Get R^2
+bayes_R2(fit2.1)
+
+# Fit all models
+models <- 
+  by_id %>%
+  mutate(model = map(data, ~ update(fit2.1, newdata = ., seed = 2)))
+
+print(models)
+
+# data for table 2.2
+mean.structure <- 
+  models %>%
+  mutate(coefs = map(model, ~ posterior_summary(.)[1:2, 1:2] %>%
+                       data.frame() %>%
+                       rownames_to_column("coefficients"))) %>%
+  unnest(coefs) %>%
+  select(-data, -model) %>%
+  unite(temp, Estimate, Est.Error) %>%
+  pivot_wider(names_from = coefficients,
+              values_from = temp) %>%
+  separate(b_Intercept, into = c("init_stat_est", "init_stat_sd"), sep = "_") %>%
+  separate(b_time, into = c("rate_change_est", "rate_change_sd"), sep = "_") %>%
+  mutate_if(is.character, ~ as.double(.) %>% round(digits = 2)) %>%
+  ungroup()
+
+head(mean.structure)
+
+residual.variance <- 
+  models %>%
+  mutate(residual_variance = map_dbl(model, ~ posterior_summary(.)[3, 1])^2) %>%
+  mutate_if(is.double, round, digits = 2) %>%
+  select(id, residual_variance)
+
+head(residual.variance)
+
+r2 <-
+  models %>% 
+  mutate(r2 = map_dbl(model, ~ bayes_R2(., robust = T)[1])) %>% 
+  mutate_if(is.double, round, digits = 2) %>% 
+  select(id, r2)
+
+head(r2)
+
+table2.2 <- 
+  models %>%
+  unnest(data) %>%
+  group_by(id) %>%
+  slice(1) %>%
+  select(id, male, exposure) %>%
+  left_join(mean.structure, by = "id") %>%
+  left_join(residual.variance, by = "id") %>%
+  left_join(r2, by = "id") %>%
+  rename(residual_var = residual_variance) %>%
+  select(id, init_stat_est:r2, everything()) %>%
+  ungroup()
+
+table2.2 %>% 
+  knitr::kable()
+
+# figure 2.5
+by_id %>%
+  unnest(data) %>%
+  ggplot(aes(x = time, y = tolerance, group = id)) +
+  geom_point() +
+  geom_abline(data = mean.structure, 
+              aes(intercept = init_stat_est, 
+                  slope = rate_change_est,
+                  group = id),
+              color = "blue") +
+  scale_x_continuous(breaks = 0:4, labels = 0:4 + 11) +
+  coord_cartesian(ylim = c(0, 4)) +
+  theme(panel.grid = element_blank()) +
+  facet_wrap(~ id)
+
+#### OR
+ggplot(data = tolerance_pp, aes(x = time, y = tolerance)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  coord_cartesian(ylim = c(0, 4)) +
+  theme(panel.grid = element_blank()) +
+  facet_wrap(~ id)
+```
+
+# Exploring differences in change across people
+
+Does everyone change in the same way? Or do the trajectories of change differ substantially across people?
+
+## Examining the entire set of smooth trajectories
+
+This plot allows us to see the entire set of growth trajectories across individuals.
+
+```{r warning = FALSE}
+tolerance_pp %>%
+  ggplot(aes(x = age, y = tolerance)) +
+  stat_smooth(method = "loess", se = F, span = 0.9, size = 2) +
+  stat_smooth(aes(group = id), method = "loess", se = F, span = 0.9, size = 1/4) +
+  coord_cartesian(ylim = c(0, 4)) +
+  theme(panel.grid = element_blank())
+
+tolerance_pp %>%
+  ggplot(aes(x = age, y = tolerance)) +
+  stat_smooth(method = "lm", se = F, span = 0.9, size = 2) +
+  stat_smooth(aes(group = id), method = "lm", se = F, span = 0.9, size = 1/4) +
+  coord_cartesian(ylim = c(0, 4)) +
+  theme(panel.grid = element_blank())
+```
+
+## Using the Results of Model Fitting to Frame Questions about Change
+
+Rather than asking "Do individuals differ in their changes, and if so, how?" we can now ask "Do individuals differ in their intercepts? In their slopes?"
+
+To learn about the observed average pattern of change, we examine the sample averages of the fitted intercepts and slopes; these tell us about the average initial status and the average annual rate of change in the sample as a whole.
+
+To learn about the observed individual differences in change, we examine the sample variance and standard deviations of the intercepts and slopes; these tell us about the observed variability in initial status and rates of change in the sample.
+
+To learn about the observed relationship between initial status and the rate of change, we can examine the sample covariance or correlation between intercepts and slopes.
+
+We'll examine three quantities:
+
+1.  **Sample means of the estimated intercepts and slopes.** The level-1 OLS-estimated intercepts and slopes are unbiased estimates of initial status and rate of change for each person. Their sample means are therefore unbiased estimates of the key features of the average observed change trajectory.
+2.  **Sample Variances (or standard deviations) of the estimated intercepts and slopes.** These measures quantify the amount of observed interindividual heterogeneity in change.
+3.  **Sample correlation between estimated intercepts and slopes.** This correlation summarizes the association between fitted initial status and fitted rate of change and answers the question: Are observed initial status and rate of change related?
+
+```{r}
+mean.structure %>% 
+  pivot_longer(ends_with("est")) %>% 
+  group_by(name) %>% 
+  summarise(mean = mean(value),
+            sd   = sd(value)) %>% 
+  mutate_if(is.double, round, digits = 2)
+
+mean.structure %>% 
+  select(init_stat_est, rate_change_est) %>% 
+  cor() %>% 
+  round(digits = 2)
+```
+
+Interpretations:
+
+-   The average adolescent in this sample has an observed tolerance level of 1.36 at age 11 and that this increases by an estimated 0.13 points per year.
+
+-   The magnitude of the sample standard deviations suggests that adolescents differ considerably in their averages.
+
+-   The correlation between the initial status and the rate of change suggests that adolescents with greater initial tolerance tend to become more tolerant less rapidly over time.
+
+## Exploring the relationship between change and time-invariant predictors
+
+Evaluating the impact of predictors helps you uncover systematic patterns in the individual change trajectories corresponding to interindividual variation in personal characteristics.
+
+### Graphically examining groups of smoothed individual growth trajectories
+
+```{r}
+fit2.4 <- update(fit2.1,
+                 newdata = tolerance_pp,
+                 tolerance ~ 1 + time * male)
+print(fit2.4)
+
+## calculate fitted values
+tol.fitted.male <- 
+  tibble(male = rep(c(0, 1), each = 2),
+         age = rep(c(11, 15), times = 2)) %>%
+  mutate(time = age - 11,
+         tolerance = fixef(fit2.4)[1, 1] +
+           fixef(fit2.4)[2, 1] * time +
+           fixef(fit2.4)[3, 1] * male +
+           fixef(fit2.4)[4, 1] * time * male)
+tol.fitted.male
+
+ggplot(data = tolerance_pp, aes(x = time, y = tolerance)) +
+  facet_wrap(~ male) +
+  stat_smooth(method = "lm", se = F, span = 0.9, size = 2) +
+  stat_smooth(aes(group = id), method = "lm", se = F, span = 0.9, size = 1/4) +
+  coord_cartesian(ylim = c(0, 4)) +
+  theme(panel.grid = element_blank())
+
+tolerance_pp %>%
+  mutate(exposure_dum = ifelse(exposure > median(exposure), 1, 0)) %>%
+  ggplot(data = ., aes(x = time, y = tolerance)) +
+  facet_wrap(~ exposure_dum) +
+  stat_smooth(method = "lm", se = F, span = 0.9, size = 2) +
+  stat_smooth(aes(group = id), method = "lm", se = F, span = 0.9, size = 1/4) +
+  coord_cartesian(ylim = c(0, 4)) +
+  theme(panel.grid = element_blank())
+```
+
+### The relationship between OLS-Estimated Trajectories and Substantive Predictors
+
+We can explore whether the initial tolerance of deviant behavior or the annual rate of change in tolerance is observed to differ by: (1) gender or (2) early exposure to deviant behavior.
+
+# Improving the Precision and Reliability of OLS-Estimated Rates of Change: Lessons for Research Design

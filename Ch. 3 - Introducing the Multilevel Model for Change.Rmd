@@ -1,0 +1,163 @@
+---
+title: "Chapter 3 - Introducing the Multilevel Model for Change"
+output: html_notebook
+---
+
+# What is the Purpose of the Multilevel Model for Change?
+
+Statistical models are statements about the population process that generated the data.
+
+A statistical model of change must specify (1) a level-1 submodel that describes how individuals change over time; and (2) a level-2 submodel that describes how these changes vary across individuals.
+
+```{r}
+library(tidyverse)
+
+early.int <-
+  tibble(id = rep(c(68, 70:72, 902, 904, 906, 908), each = 3),
+         age = rep(c(1, 1.5, 2), times = 8),
+         cog = c(103, 119, 96, 106, 107, 96, 112, 86, 73, 100, 93, 87, 
+                     119, 93, 99, 112, 98, 79, 89, 66, 81, 117, 90, 76),
+         program = rep(1:0, each = 12))
+
+print(early.int)
+
+early.int <- 
+  early.int %>%
+  mutate(age_c = age - 1)
+
+# simulate data
+# how many people are we simulating?
+n <- 103 - 8
+
+# what's the variance/covariance matrix?
+sigma <- matrix(c(124.64, -36.41,
+                  -36.41, 12.29),
+                ncol = 2)
+
+# what's our mean structure?
+mu <- c(0, 0)
+
+# set the seed and simulate!
+set.seed(3)
+z <-
+  MASS::mvrnorm(n = n, mu = mu, Sigma = sigma) %>% 
+  data.frame() %>% 
+  set_names("zeta_0", "zeta_1")
+
+head(z)
+
+g <-
+  tibble(id = 1:n,
+         gamma_00 = 107.84,
+         gamma_01 = 6.85,
+         gamma_10 = -21.13,
+         gamma_11 = 5.27)
+
+head(g)
+
+# set the seed for the second `mutate()` line
+set.seed(3)
+
+early.int.sim <-
+  bind_cols(g, z) %>% 
+  mutate(program = rep(1:0, times = c(54, 41))) %>% 
+  expand(nesting(id, gamma_00, gamma_01, gamma_10, gamma_11, zeta_0, zeta_1, program),
+         age_c = c(0, 0.5, 1)) %>% 
+  mutate(epsilon = rnorm(n(), mean = 0, sd = sqrt(74.24))) %>% 
+  mutate(pi_0 = gamma_00 + gamma_01 * program + zeta_0,
+         pi_1 = gamma_10 + gamma_11 * program + zeta_1) %>% 
+  mutate(cog = pi_0 + pi_1 * age_c + epsilon)
+
+head(early.int.sim)
+
+early.int.sim <-
+  early.int.sim %>% 
+  mutate(age = age_c + 1,
+         cog = round(cog, digits = 0),
+         id  = ifelse(id > 54, id + 900, id))
+
+head(early.int.sim)
+
+early.int.sim <-
+  early.int.sim %>% 
+  select(id, age, cog, program, age_c) %>% 
+  full_join(early.int,
+            by = c("id", "age", "cog", "program", "age_c")) %>% 
+  arrange(id, age)
+
+glimpse(early.int.sim)
+```
+
+# The Level-1 Submodel for Individual Change
+
+The level-1 component of the multilevel model, or individual growth model, represents the change we expect each member of the population to experience during the time period under study.
+
+```{r}
+early.int %>%
+  ggplot(., aes(x = age, y = cog)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ id)
+```
+
+## The Structural Part of the Level-1 Submodel
+
+We will estimate the following model: $$
+\begin{aligned}
+\pi_{0i} &= \gamma_{00} + \gamma_{01} \text{Program}_i + \epsilon_{0i} \\
+\pi_{1i} &= \gamma_{10} + \gamma_{11} \text{Program}_i + \epsilon_{1i} \\
+\end{aligned}
+$$
+
+$\gamma_{01}$ and $\gamma_{11}$ capture the effects of the program. $\gamma_{01}$ represents the the hypothesized difference in average true initial status between groups; $\gamma_{11}$ represents the hypothesized differences in average true annual rate of change. These level-2 parameters therefore address the question: What is the difference in the average trajectory of true change associated with program participation?
+
+## The Structural Components of the Level-2 Submodel
+
+# Fitting the Multilevel Model for Change to Data
+
+# Examining Estimated Fixed Effects
+
+## Interpreting Estimated Fixed Effects
+
+```{r}
+library(brms)
+library(cmdstanr)
+fit3.2 <- brm(data = early.int.sim,
+              family = gaussian,
+              formula = cog ~ 0 + Intercept + age_c * program + (1 + age_c | id),
+              iter = 2000, warmup = 1000, chains = 4, cores = 4, 
+              backend = "cmdstanr", control = list(adapt_delta = 0.9))
+print(fit3.2)
+```
+
+We can fill in our equation with these estimates:
+
+$$
+\begin{aligned}
+\pi_{0i} &= 106.65 + 9.11 \text{Program}_i \\
+\pi_{1i} &= -20.59 + 3.37 \text{Program}_i \\
+\end{aligned}
+$$
+
+We estimate the true initial status (COG at age 1) for the average nonparticipant to be 106.65; for the average participant we estimate that it is 9.11 points higher. The true annual rate of change for the average nonparticipant is -20.59; for the average participant, we estimate it to be 3.37 points higher. The average nonparticipant dropped 20 points during the second year of life; the average participant dropped 17.22 points. The intervention slows the rate of decline.
+
+```{r}
+# specify the values for our covariates `age_c` and `program`
+crossing(age_c = 0:1,
+         program = 0:1) %>% 
+  # push those values through the fixed effects
+  mutate(cog = fixef(fit3.2)[1, 1] + fixef(fit3.2)[2, 1] * age_c + fixef(fit3.2)[3, 1] * program + fixef(fit3.2)[4, 1] * age_c * program,
+         # wrangle a bit
+         age = age_c + 1,
+         size = ifelse(program == 1, 1/5, 3),
+         program = factor(program, levels = c("0", "1"))) %>% 
+
+  # plot!
+ggplot(aes(x = age, y = cog, group = program)) +
+  geom_line(aes(size = program)) +
+  scale_size_manual(values = c(1, 1/2)) +
+  scale_x_continuous(breaks = c(1, 1.5, 2)) +
+  ylim(50, 150) +
+  theme(legend.position = "none",
+        panel.grid = element_blank())
+```
