@@ -1,0 +1,788 @@
+---
+title: "Chapter 11 - Fitting Basic Discrete-Time Hazard Models"
+output: html_notebook
+---
+
+We address quetions about why events occur at different times for different people by fitting statistical models of hazard data. In specifying a particular hazard model, you make hypotheses about how you think the risk of event occurrence is systematically related to predictors. To conduct a credible discrete-time survival analysis, you must:
+
+1. Specify a suitable model for hazard and understand its assumptions;
+2. Use sample data to estimate the model parameters;
+3. Interpret results in terms of your research questions;
+4. Evaluate model fit and test hypotheses about model parameters;
+5. Communicate your findings
+
+# Toward a Statistical Model for Discrete-Time Hazard
+
+```{r}
+library(tidyverse)
+
+sex <- read_csv("data/firstsex.csv")
+
+glimpse(sex)
+```
+
+Here are the cases broken down by time and censor status:
+
+```{r}
+sex %>%
+  count(time, censor)
+```
+
+Compute the percent who already had sex by the 12th grade.
+
+```{r}
+sex %>%
+  count(censor) %>%
+  mutate(percent = 100 * (n / sum(n)))
+```
+
+Next, we break our data down by our central predictor `pt` which is coded 0 for boys who lived with both biological parents and 1 for boys who experienced one or more parenting transitions before the 7th grade. 
+```{r}
+sex %>%
+  count(pt) %>%
+  mutate(percent = 100 * (n / sum(n)))
+```
+
+## Plots of Within-Group Hazard Functions and Survivor Functions
+
+```{r}
+library(survival)
+
+# cases for which `pt == 0`
+fit11.1 <- survfit(data = sex %>% filter(pt == 0), Surv(time, 1 - censor) ~ 1)
+
+# cases for which `pt == 1`
+fit11.2 <- survfit(data = sex %>% filter(pt == 1), Surv(time, 1 - censor) ~ 1)
+
+# all cases
+fit11.3 <- survfit(data = sex, Surv(time, 1 - censor) ~ 1)
+```
+
+Construct life tables from the fit results.
+
+```{r}
+make_lt <- function(fit) {
+  
+  # arrange the lt data for all rows but the first
+  most_rows <-
+    tibble(time = fit$time) %>% 
+    mutate(time_int = str_c("[", time, ", ", time + 1, ")"), 
+           n_risk   = fit$n.risk, 
+           n_event  = fit$n.event) %>% 
+    mutate(n_censored   = n_risk - n_event - lead(n_risk, default = 0),
+           hazard_fun   = n_event / n_risk,
+           survivor_fun = fit$surv)
+  
+  # define the values for t = 2 and t = 1
+  time_1 <- fit$time[1]
+  time_0 <- time_1 - 1
+  
+  # define the values for the row for which t = 1
+  row_1 <-
+    tibble(time         = time_0, 
+           time_int     = str_c("[", time_0, ", ", time_1, ")"),
+           n_risk       = fit$n.risk[1],
+           n_event      = NA,
+           n_censored   = NA,
+           hazard_fun   = NA, 
+           survivor_fun = 1)
+  
+  # make the full life table
+  lt <-
+    bind_rows(row_1,
+              most_rows)
+  
+  lt
+}
+
+lt <-
+  bind_rows(make_lt(fit11.1),
+            make_lt(fit11.2),
+            make_lt(fit11.3)) %>% 
+  mutate(pt = factor(rep(c("pt = 0", "pt = 1", "overall"), each = n() / 3))) %>% 
+  select(pt, everything())
+
+lt
+```
+
+Figure 11.1
+
+```{r}
+p1 <-
+  lt %>% 
+  filter(pt != "overall") %>% 
+  
+  ggplot(aes(x = time, y = hazard_fun, color = pt, group = pt)) +
+  geom_line() +
+  scale_color_viridis_d(NULL, option = "A", end = .5) +
+  scale_x_continuous("grade", breaks = 6:12, limits = c(6, 12)) +
+  scale_y_continuous("estimated hazard probability", 
+                     limits = c(0, .5)) +
+  theme(panel.grid = element_blank())
+
+p2 <-
+  lt %>% 
+  filter(pt != "overall") %>% 
+  
+  ggplot(aes(x = time, y = survivor_fun, color = pt, group = pt)) +
+  geom_hline(yintercept = .5, color = "white", linetype = 2) +
+  geom_line() +
+  scale_color_viridis_d(NULL, option = "A", end = .5) +
+  scale_x_continuous("grade", breaks = 6:12, limits = c(6, 12)) +
+  scale_y_continuous("estimated survival probability",
+                     breaks = c(0, .5, 1), limits = c(0, 1)) +
+  theme(panel.grid = element_blank())
+
+library(patchwork)
+
+(p1 / p2) + plot_layout(guides = "collect")
+```
+
+When examining plots like these, you should ask two major questions:
+
+* What is the shape of the hazard function for each group?
+* Does the relative level of the hazard function differ across groups?
+
+## What Kind of Statistical Model Do These Graphs Suggest?
+
+The hypothesized model must describe the shape of the entire discrete-time hazard function over time, not just its value in any one period. Second, as a conditional probability the value of discrete-time hazard must lie between 0 and 1. 
+
+### The bounded Nature of Hazard
+
+Link function. 
+
+### What Statistical Model Could Have Generate These Sample Data?
+
+```{r}
+sex.pp <- read_csv("data/firstsex_pp.csv")
+
+glimpse(sex.pp)
+
+sex.aggregated <- 
+  sex.pp %>%
+  mutate(event = if_else(event == 1, "event", "no_event")) %>%
+  group_by(period) %>%
+  count(event, pt) %>%
+  ungroup() %>%
+  pivot_wider(names_from = event, values_from = n) %>%
+  mutate(total = event + no_event,
+         period_center = period - mean(period),
+         period_factor= factor(period),
+         pt = factor(pt))
+
+sex.aggregated
+```
+
+* `period` is time as a continuous value
+* `period_center` is time as a mean-centered value
+* `period_factor` is time as a factor
+
+```{r}
+library(brms)
+library(cmdstanr)
+
+# top panel
+fit11.4 <-
+  brm(data = sex.aggregated,
+      family = binomial,
+      event | trials(total) ~ 0 + pt,
+      prior(normal(0, 4), class = b),
+      chains = 4, cores = 4, iter = 2000, warmup = 1000,
+      seed = 11,
+      backend = "cmdstan")
+
+# middle panel
+fit11.5 <-
+  brm(data = sex.aggregated,
+      family = binomial,
+      event | trials(total) ~ 0 + pt + period_center,
+      prior(normal(0, 4), class = b),
+      chains = 4, cores = 4, iter = 2000, warmup = 1000,
+      seed = 11,
+      backend = "cmdstan")
+
+# bottom panel
+fit11.6 <-
+  brm(data = sex.aggregated,
+      family = binomial,
+      event | trials(total) ~ 0 + pt + period_factor,
+      prior(normal(0, 4), class = b),
+      chains = 4, cores = 4, iter = 2000, warmup = 1000,
+      seed = 11,
+      backend = "cmdstan")
+```
+
+Plot the model fits:
+
+```{r}
+# logit(hazard) is horizontal with time
+p1 <-
+  fitted(fit11.4,
+         scale = "linear") %>% 
+  data.frame() %>% 
+  bind_cols(sex.aggregated) %>% 
+  mutate(pt = str_c("pt = ", pt)) %>% 
+  
+  ggplot(aes(x = period, group = pt,
+             fill = pt, color = pt)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5),
+              size = 0, alpha = 1/4) +
+  geom_line(aes(y = Estimate),
+            alpha = 1/2) +
+  geom_point(aes(y = log_odds(event / total))) +
+  scale_y_continuous(NULL, limits = c(-4, 0)) +
+  labs(subtitle = "logit(hazard) is horizontal with time") +
+  theme(legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(color = "grey92"),
+        legend.position = c(.1, .825))
+
+# logit(hazard) is linear with time
+p2 <-
+  fitted(fit11.5,
+         scale = "linear") %>% 
+  data.frame() %>% 
+  bind_cols(sex.aggregated) %>% 
+  
+  ggplot(aes(x = period, group = pt,
+             fill = pt, color = pt)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5),
+              size = 0, alpha = 1/4) +
+  geom_line(aes(y = Estimate),
+            alpha = 1/2) +
+  geom_point(aes(y = log_odds(event / total))) +
+  labs(subtitle = "logit(hazard) is linear with time",
+       y = "logit(hazard)") +
+  coord_cartesian(ylim = c(-4, 0)) +
+  theme(legend.position = "none")
+
+# logit(hazard) is completely general with time
+p3 <-
+  fitted(fit11.6,
+         scale = "linear") %>% 
+  data.frame() %>% 
+  bind_cols(sex.aggregated) %>% 
+  
+  ggplot(aes(x = period, group = pt,
+             fill = pt, color = pt)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5),
+              size = 0, alpha = 1/4) +
+  geom_line(aes(y = Estimate),
+            alpha = 1/2) +
+  geom_point(aes(y = log_odds(event / total))) +
+  labs(subtitle = "logit(hazard) is completely general with time",
+       y = NULL) +
+  coord_cartesian(ylim = c(-4, 0)) +
+  theme(legend.position = "none")
+
+(p1 / p2 / p3) &
+  scale_fill_viridis_d(NULL, option = "A", end = .6) &
+  scale_color_viridis_d(NULL, option = "A", end = .6) &
+  scale_x_continuous("Grade", breaks = 6:12, limits = c(6, 12)) &
+  theme(panel.grid = element_blank())
+```
+
+
+LOO comparison:
+
+```{r}
+model_weights(fit11.4, fit11.5, fit11.6, weights = "loo") %>% round(digits = 3)
+```
+
+# A Formal Representation of the Population Discrete-Time Hazard Model
+
+```{r}
+tibble(period = 1:6) %>% 
+  mutate(d1 = if_else(period == 1, 1, 0),
+         d2 = if_else(period == 2, 1, 0),
+         d3 = if_else(period == 3, 1, 0),
+         d4 = if_else(period == 4, 1, 0),
+         d5 = if_else(period == 5, 1, 0),
+         d6 = if_else(period == 6, 1, 0))
+```
+
+Using dummies for time and as predictors in the model makes the interpretation:
+
+* Each intercept parameter represents the value of logit hazard in that particular time period for individuals in the "baseline" group
+* Each slope parameter assesses the effect of a one unit difference in that predictor on event occurrence
+
+## What Do the Parameters Represent?
+
+## An Alternative Representation of the Model
+
+```{r}
+f <-
+  fitted(fit11.6,
+         scale = "linear") %>% 
+  data.frame() %>% 
+  bind_cols(sex.aggregated)
+
+f
+```
+
+```{r}
+# logit(hazard)
+p1 <-
+  f %>% 
+  mutate(pt = str_c("pt = ", pt)) %>% 
+  
+  ggplot(aes(x = period, group = pt,
+             fill = pt, color = pt)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5),
+              size = 0, alpha = 1/6) +
+  geom_line(aes(y = Estimate)) +
+  labs(subtitle = "logit(hazard)",
+       y = NULL) +
+  coord_cartesian(ylim = c(-4, 0)) +
+  theme(legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(color = "grey92"),
+        legend.position = c(.1, .825))
+
+# odds
+p2 <-
+  f %>% 
+  mutate_at(vars(Estimate, Q2.5, Q97.5), .funs = exp) %>% 
+  
+  ggplot(aes(x = period, group = pt,
+             fill = pt, color = pt)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5),
+              size = 0, alpha = 1/6) +
+  geom_line(aes(y = Estimate)) +
+  labs(subtitle = "odds",
+       y = NULL) +
+  coord_cartesian(ylim = c(0, .8)) +
+  theme(legend.position = "none")
+
+# hazard
+p3 <-
+  f %>% 
+  mutate_at(vars(Estimate, Q2.5, Q97.5), .funs = inv_logit_scaled) %>% 
+  
+  ggplot(aes(x = period, group = pt,
+             fill = pt, color = pt)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5),
+              size = 0, alpha = 1/6) +
+  geom_line(aes(y = Estimate)) +
+  labs(subtitle = "hazard (i.e., probability)",
+       y = NULL) +
+  coord_cartesian(ylim = c(0, .5)) +
+  theme(legend.position = "none")
+
+(p1 / p2 / p3) &
+  scale_fill_viridis_d(NULL, option = "A", end = .6) &
+  scale_color_viridis_d(NULL, option = "A", end = .6) &
+  scale_x_continuous("Grade", breaks = 6:12, limits = c(6, 12)) &
+  theme(panel.grid = element_blank())
+```
+
+# Fitting a Discrete-Time Hazard Model to Data
+
+## Adding Predictors to the Person-Period Data Set
+
+```{r}
+sex.pp %>%
+  glimpse()
+```
+
+## Maximum Likelihood Estimates for the Discrete-Time Hazard Model
+
+## Fitting the Discrete-Time Hazard Model to Data
+
+```{r}
+# model a
+fit11.7 <-
+  brm(data = sex.pp,
+      family = bernoulli(link = "logit"),
+      event ~ 0 + d7 + d8 + d9 + d10 + d11 + d12,
+      prior(normal(0, 4), class = b),
+      chains = 4, cores = 4, iter = 2000, warmup = 1000,
+      seed = 11,
+      backend = "cmdstan")
+print(fit11.7)
+
+fit11.7alt <-
+  brm(data = sex.pp,
+      family = bernoulli(link = "logit"),
+      event ~ 0 + factor(period),
+      prior(normal(0, 4), class = b),
+      chains = 4, cores = 4, iter = 2000, warmup = 1000,
+      seed = 11,
+      backend = "cmdstan")
+print(fit11.7alt)
+
+# model b
+fit11.8 <-
+  brm(data = sex.pp,
+      family = binomial,
+      event | trials(1) ~ 0 + d7 + d8 + d9 + d10 + d11 + d12 + pt,
+      prior(normal(0, 4), class = b),
+      chains = 4, cores = 4, iter = 2000, warmup = 1000,
+      seed = 11,
+      backend = "cmdstan")
+
+# model c
+fit11.9 <-
+  brm(data = sex.pp,
+      family = binomial,
+      event | trials(1) ~ 0 + d7 + d8 + d9 + d10 + d11 + d12 + pas,
+      prior(normal(0, 4), class = b),
+      chains = 4, cores = 4, iter = 2000, warmup = 1000,
+      seed = 11,
+      backend = "cmdstan")
+
+# model d
+fit11.10 <-
+  brm(data = sex.pp,
+      family = binomial,
+      event | trials(1) ~ 0 + d7 + d8 + d9 + d10 + d11 + d12 + pt + pas,
+      prior(normal(0, 4), class = b),
+      chains = 4, cores = 4, iter = 2000, warmup = 1000,
+      seed = 11,
+      backend = "cmdstan")
+```
+
+# Interpreting Parameter Estimates
+
+## The Time Indicators
+
+The time predictors are the baseline logit hazard function. The amount and direction of variation in their values dsecribe the shape of this function nad tell us whether risk increases, decreaes, or remains steady over time. 
+
+```{r}
+library(tidybayes)
+
+fit11.7 %>%
+  posterior_samples() %>%
+  select(contains("d")) %>%
+  pivot_longer(cols = everything(), names_to = "term", values_to = "estimate") %>%
+  group_by(term) %>%
+  median_hdi() %>%
+  mutate_at(vars(estimate:.upper), .funs = inv_logit_scaled) %>% 
+  mutate(term = factor(str_remove(term, "b_"), levels = str_c("d", 12:7))) %>%
+  ggplot(aes(x = term, y = estimate, ymin = .lower, ymax = .upper)) +
+  geom_pointrange(fatten = 2.5) +
+  labs(x = NULL,
+       y = "posterior (hazard scale)") +
+  coord_flip() +
+  theme(axis.text.y = element_text(hjust = 0),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank())
+
+stanplot(fit11.7)
+```
+
+## Dichotomous Substantive Predictors
+
+```{r}
+fixef(fit11.8)["pt", ]
+
+fixef(fit11.8)["pt", 1] %>% exp()
+
+library(tidybayes)
+
+posterior_samples(fit11.8) %>% 
+  transmute(`log-odds`     = b_pt,
+            `hazard ratio` = exp(b_pt)) %>% 
+  pivot_longer(everything()) %>% 
+  mutate(name = factor(name,
+                       levels = c("log-odds", "hazard ratio"))) %>% 
+  
+  ggplot(aes(x = value, y = 0)) +
+  stat_halfeyeh(.width = c(.5, .95),
+                normalize = "panels") +
+  scale_y_continuous(NULL, breaks = NULL) +
+  xlab("marginal posterior for pt") +
+  theme(panel.grid = element_blank()) +
+  facet_wrap(~name, scales = "free")
+```
+
+## Continuous Substantive Predictors
+
+The main effect of `PAS` is positive which indicates that in each grade boys whose parents manifest higher levels of antisocial behavior are more likely to have intercourse. 
+
+```{r}
+fixef(fit11.9)["pas", ]
+
+posterior_samples(fit11.9) %>% 
+  transmute(`log-odds`     = b_pas,
+            `hazard ratio` = exp(b_pas)) %>% 
+  pivot_longer(everything()) %>% 
+  mutate(name = factor(name,
+                       levels = c("log-odds", "hazard ratio"))) %>% 
+  
+  ggplot(aes(x = value, y = 0)) +
+  stat_halfeyeh(.width = c(.5, .95),
+                normalize = "panels") +
+  scale_y_continuous(NULL, breaks = NULL) +
+  xlab("marginal posterior for pas") +
+  theme(panel.grid = element_blank()) +
+  facet_wrap(~name, scales = "free")
+
+posterior_samples(fit11.9) %>% 
+  transmute(`log-odds`                   = b_pas,
+            `hazard ratio`               = exp(b_pas),
+            `hr for a 2-unit difference` = exp(b_pas * 2)) %>% 
+  pivot_longer(everything()) %>% 
+  mutate(name = factor(name,
+                       levels = c("log-odds", "hazard ratio", "hr for a 2-unit difference"))) %>%
+  
+  ggplot(aes(x = value, y = 0)) +
+  stat_halfeyeh(.width = c(.5, .95),
+                normalize = "panels") +
+  scale_y_continuous(NULL, breaks = NULL) +
+  xlab("marginal posterior for pas") +
+  theme(panel.grid = element_blank()) +
+  facet_wrap(~name, scales = "free")
+```
+
+# Displaying Fitted Hazard and Survivor Functions
+
+## A Strategy for a Single Categorical Substantive Predictor
+
+```{r}
+tibble(time  = 7:12,
+       alpha = fixef(fit11.8)[1:6, 1],
+       beta  = fixef(fit11.8)[7, 1]) %>% 
+  mutate(lh0 = alpha,
+         lh1 = alpha + beta) %>% 
+  mutate(h0 = inv_logit_scaled(lh0),
+         h1 = inv_logit_scaled(lh1)) %>% 
+  mutate(s0 = cumprod(1 - h0),
+         s1 = cumprod(1 - h1)) %>% 
+  # this just simplifies the output
+  mutate_if(is.double, round, digits = 4)
+
+nd <-
+  crossing(pt     = 0:1,
+           period = 7:12) %>% 
+  mutate(d7  = if_else(period == 7, 1, 0),
+         d8  = if_else(period == 8, 1, 0),
+         d9  = if_else(period == 9, 1, 0),
+         d10 = if_else(period == 10, 1, 0),
+         d11 = if_else(period == 11, 1, 0),
+         d12 = if_else(period == 12, 1, 0))
+
+f <-
+  fitted(fit11.8,
+         newdata = nd,
+         scale = "linear") %>% 
+  data.frame() %>% 
+  bind_cols(nd) %>% 
+  mutate(pt = str_c("pt = ", pt))
+
+f
+```
+
+Upper two panels of figure 11.6
+
+```{r}
+# logit(hazard)
+p1 <-
+  f %>% 
+  
+  ggplot(aes(x = period, group = pt,
+             fill = pt, color = pt)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5),
+              size = 0, alpha = 1/6) +
+  geom_line(aes(y = Estimate)) +
+  labs(subtitle = "fitted logit(hazard)",
+       y = NULL) +
+  coord_cartesian(ylim = c(-4, 0)) +
+  theme(legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(color = "grey92"),
+        legend.position = c(.1, .825))
+
+# hazard
+p2 <-
+  f %>% 
+  mutate_at(vars(Estimate, Q2.5, Q97.5), .funs = inv_logit_scaled) %>% 
+  
+  ggplot(aes(x = period, group = pt,
+             fill = pt, color = pt)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5),
+              size = 0, alpha = 1/6) +
+  geom_line(aes(y = Estimate)) +
+  labs(subtitle = "fitted hazard",
+       y = NULL) +
+  coord_cartesian(ylim = c(0, .5)) +
+  theme(legend.position = "none")
+```
+
+```{r}
+nd <-
+  crossing(pt     = 0:1,
+           period = 6:12) %>% 
+  mutate(d6  = if_else(period == 6, 1, 0),
+         d7  = if_else(period == 7, 1, 0),
+         d8  = if_else(period == 8, 1, 0),
+         d9  = if_else(period == 9, 1, 0),
+         d10 = if_else(period == 10, 1, 0),
+         d11 = if_else(period == 11, 1, 0),
+         d12 = if_else(period == 12, 1, 0))
+
+f <-
+  fitted(fit11.8,
+         newdata = nd) %>% 
+  data.frame() %>% 
+  bind_cols(nd) %>% 
+  mutate(pt = str_c("pt = ", pt))
+
+f
+
+f <-
+  f %>% 
+  mutate(Estimate = if_else(period == 6, 0, Estimate),
+         Q2.5     = if_else(period == 6, 0, Q2.5),
+         Q97.5    = if_else(period == 6, 0, Q97.5)) %>% 
+  group_by(pt) %>% 
+  mutate(s       = cumprod(1 - Estimate),
+         s_lower = cumprod(1 - Q2.5),
+         s_upper = cumprod(1 - Q97.5)) %>% 
+  select(pt:d12, s:s_upper)
+
+f %>% glimpse()
+
+make_iml <- function(lt) {
+  
+  # lt is a generic name for a life table of the 
+  # kind we made with our `make_lt()` function
+  
+  # determine the mth row
+  lt_m <-
+    lt %>% 
+    filter(survivor_fun > .5) %>% 
+    slice(n())
+  
+  # determine the row for m + 1
+  lt_m1 <-
+    lt %>% 
+    filter(survivor_fun < .5) %>% 
+    slice(1)
+  
+  # pull the value for m
+  m  <- pull(lt_m, time)
+  
+  # pull the two survival function values
+  stm  <- pull(lt_m, survivor_fun)
+  stm1 <- pull(lt_m1, survivor_fun)
+  
+  # plug the values into Equation 10.6 (page 338)
+  iml <- m + ((stm - .5) / (stm - stm1)) * ((m + 1) - m)
+  
+  iml
+  
+}
+
+# save the interpolated median lifetime values
+imls <- c(make_iml(lt %>% filter(pt == "pt = 0")), make_iml(lt %>% filter(pt == "pt = 1")))
+
+# hazard
+p3 <-
+  f %>% 
+  
+  ggplot(aes(x = period, group = pt,
+             fill = pt, color = pt)) +
+  geom_hline(yintercept = .5, color = "white") +
+  geom_segment(x = imls[1], xend = imls[1],
+               y = -Inf, yend = .5,
+               color = "white", linetype = 2) +
+  geom_segment(x = imls[2], xend = imls[2],
+               y = -Inf, yend = .5,
+               color = "white", linetype = 2) +
+  geom_ribbon(aes(ymin = s_lower, ymax = s_upper),
+              size = 0, alpha = 1/6) +
+  geom_line(aes(y = s)) +
+  scale_y_continuous(NULL, breaks = c(0, .5, 1)) +
+  labs(subtitle = "fitted survival probability") +
+  coord_cartesian(ylim = c(0, 1)) +
+  theme(legend.position = "none")
+
+(p1 / p2 / p3) &
+  scale_fill_viridis_d(NULL, option = "A", end = .6) &
+  scale_color_viridis_d(NULL, option = "A", end = .6) &
+  scale_x_continuous("Grade", breaks = 6:12, limits = c(6, 12)) &
+  theme(panel.grid = element_blank())
+```
+
+## Extending the Strategy to Multiple Predictors (Some of Which Are Continuous)
+
+Instead of plotting one fitted function for each predictor value, selet several prototypical predictor values.
+
+```{r}
+nd <-
+  crossing(pt  = 0:1,
+           pas = -1:1) %>% 
+  expand(nesting(pt, pas),
+         period = 6:12) %>% 
+  mutate(d6  = if_else(period == 6, 1, 0),
+         d7  = if_else(period == 7, 1, 0),
+         d8  = if_else(period == 8, 1, 0),
+         d9  = if_else(period == 9, 1, 0),
+         d10 = if_else(period == 10, 1, 0),
+         d11 = if_else(period == 11, 1, 0),
+         d12 = if_else(period == 12, 1, 0))
+
+f <-
+  fitted(fit11.10,
+         newdata = nd) %>% 
+  data.frame() %>% 
+  bind_cols(nd)
+
+head(f)
+```
+
+Figure 11.7
+
+```{r}
+# logit(hazard)
+p1 <-
+  f %>% 
+  mutate(pt  = str_c("pt = ", pt),
+         pas = str_c("pas = ", pas)) %>% 
+  mutate(pas = factor(pas,
+                      levels = str_c("pas = ", 1:-1))) %>% 
+  filter(period > 6) %>% 
+  
+  ggplot(aes(x = period, group = pas,
+             fill = pas, color = pas)) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5),
+              size = 0, alpha = 1/6) +
+  geom_line(aes(y = Estimate)) +
+  labs(subtitle = "fitted logit(hazard)",
+       y = NULL) +
+  coord_cartesian(ylim = c(0, .5)) +
+  facet_wrap(~pt)
+
+# hazard
+p2 <-
+  f %>% 
+  mutate(Estimate = if_else(period == 6, 0, Estimate),
+         Q2.5     = if_else(period == 6, 0, Q2.5),
+         Q97.5    = if_else(period == 6, 0, Q97.5)) %>% 
+  mutate(pt  = str_c("pt = ", pt),
+         pas = str_c("pas = ", pas)) %>% 
+  mutate(pas = factor(pas,
+                      levels = str_c("pas = ", 1:-1))) %>% 
+  group_by(pt, pas) %>% 
+  mutate(s       = cumprod(1 - Estimate),
+         s_lower = cumprod(1 - Q2.5),
+         s_upper = cumprod(1 - Q97.5)) %>% 
+  
+  ggplot(aes(x = period, group = pas,
+             fill = pas, color = pas)) +
+  geom_hline(yintercept = .5, color = "white") +
+  geom_ribbon(aes(ymin = s_lower, ymax = s_upper),
+              size = 0, alpha = 1/6) +
+  geom_line(aes(y = s)) +
+  scale_y_continuous(NULL, breaks = c(0, .5, 1)) +
+  labs(subtitle = "fitted survival probability") +
+  coord_cartesian(ylim = c(0, 1)) +
+  theme(legend.position = "none") +
+  facet_wrap(~pt)
+
+((p1 / p2) &
+  scale_fill_viridis_d(NULL, option = "D", end = .8, direction = -1) &
+  scale_color_viridis_d(NULL, option = "D", end = .8, direction = -1) &
+  scale_x_continuous("Grade", breaks = 6:12, limits = c(6, 12)) &
+  theme(panel.grid = element_blank())) +
+   plot_layout(guides = "collect")
+```
+
